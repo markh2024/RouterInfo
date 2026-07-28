@@ -17,6 +17,7 @@ MSMTP_CONF="$HOME/.msmtprc"
 REPORT="$HOME/location_report.txt"
 
 SIM900_PHONE_FILE="$HOME/.checkrouter_sim900_phone"
+SIM900_RECIPIENTS_FILE="$HOME/.checkrouter_sim900_recipients"
 ARDUINO_SKETCH_DIR="$HOME/sim900_report_sender"
 ARDUINO_SKETCH_FILE="$ARDUINO_SKETCH_DIR/sim900_report_sender.ino"
 SIM900_BAUD=9600
@@ -206,13 +207,40 @@ EOF
 
 echo
 cat "$REPORT"
+echo
+echo "Report written to:"
+echo "  $REPORT"
+
+if [ -f "$REPORT" ]
+then
+    echo "Report size: $(wc -c < "$REPORT") bytes"
+else
+    echo "ERROR: Report was not created!"
+fi
+
 
 }
 
 
 #############################################
-# Recipients management
+# Recipients management (email and/or SMS)
 #############################################
+#
+# Each line in RECIPIENTS_FILE is: email|phone
+# Either side can be blank (email-only or SMS-only recipient),
+# but not both.
+
+is_valid_email()
+{
+    [[ "$1" =~ ^[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}$ ]]
+}
+
+
+is_valid_phone()
+{
+    [[ "$1" =~ ^\+[0-9]{7,15}$ ]]
+}
+
 
 ensure_recipients_file()
 {
@@ -221,12 +249,63 @@ ensure_recipients_file()
     then
 
         cat > "$RECIPIENTS_FILE" <<EOF
-# One email address per line.
+# One recipient per line, formatted as: email|phone
+# Leave the phone blank for an email-only recipient (e.g. "someone@example.com|")
+# or the email blank for an SMS-only recipient (e.g. "|+441234567890").
 # Lines starting with # are ignored.
 EOF
 
         chmod 600 "$RECIPIENTS_FILE"
 
+    fi
+
+    # Migrate a plain email-per-line file from an older version of this script.
+    if grep -qv '^\s*#\|^\s*$\|.*|.*' "$RECIPIENTS_FILE" 2>/dev/null
+    then
+        local TMP
+        TMP="$(mktemp)"
+
+        while IFS= read -r LINE
+        do
+            if [[ "$LINE" == \#* ]] || [ -z "$(echo "$LINE" | xargs)" ] || [[ "$LINE" == *"|"* ]]
+            then
+                echo "$LINE" >> "$TMP"
+            else
+                echo "$(echo "$LINE" | xargs)|" >> "$TMP"
+            fi
+        done < "$RECIPIENTS_FILE"
+
+        mv "$TMP" "$RECIPIENTS_FILE"
+    fi
+
+    # Migrate phone numbers from the old SMS-only recipients file, if present.
+    if [ -f "$SIM900_RECIPIENTS_FILE" ]
+    then
+        while IFS= read -r LINE
+        do
+            LINE="$(echo "$LINE" | xargs)"
+            if [ -z "$LINE" ] || [[ "$LINE" == \#* ]]
+            then
+                continue
+            fi
+            if ! grep -qF "|$LINE" "$RECIPIENTS_FILE" 2>/dev/null
+            then
+                echo "|$LINE" >> "$RECIPIENTS_FILE"
+            fi
+        done < "$SIM900_RECIPIENTS_FILE"
+        rm -f "$SIM900_RECIPIENTS_FILE"
+    fi
+
+    # Migrate a number saved by the original single-destination version.
+    if [ -f "$SIM900_PHONE_FILE" ]
+    then
+        local EXISTING_NUM
+        EXISTING_NUM="$(cat "$SIM900_PHONE_FILE" 2>/dev/null | xargs)"
+        if [ -n "$EXISTING_NUM" ] && ! grep -qF "|$EXISTING_NUM" "$RECIPIENTS_FILE" 2>/dev/null
+        then
+            echo "|$EXISTING_NUM" >> "$RECIPIENTS_FILE"
+        fi
+        rm -f "$SIM900_PHONE_FILE"
     fi
 
 }
@@ -237,19 +316,33 @@ load_recipients()
 
     ensure_recipients_file
 
-    RECIPIENTS=()
+    RECIP_EMAILS=()
+    RECIP_PHONES=()
 
     while IFS= read -r LINE
     do
 
-        LINE="$(echo "$LINE" | xargs)"
+        local RAW
+        RAW="$(echo "$LINE" | xargs)"
 
-        if [ -z "$LINE" ] || [[ "$LINE" == \#* ]]
+        if [ -z "$RAW" ] || [[ "$RAW" == \#* ]]
         then
             continue
         fi
 
-        RECIPIENTS+=("$LINE")
+        local EMAIL="${LINE%%|*}"
+        local PHONE=""
+
+        if [[ "$LINE" == *"|"* ]]
+        then
+            PHONE="${LINE#*|}"
+        fi
+
+        EMAIL="$(echo "$EMAIL" | xargs)"
+        PHONE="$(echo "$PHONE" | xargs)"
+
+        RECIP_EMAILS+=("$EMAIL")
+        RECIP_PHONES+=("$PHONE")
 
     done < "$RECIPIENTS_FILE"
 
@@ -261,7 +354,7 @@ list_recipients()
 
     load_recipients
 
-    if [ ${#RECIPIENTS[@]} -eq 0 ]
+    if [ ${#RECIP_EMAILS[@]} -eq 0 ]
     then
         echo "No recipients configured yet."
         return 0
@@ -270,19 +363,30 @@ list_recipients()
     echo "Current recipients:"
 
     local I=1
+    local N=${#RECIP_EMAILS[@]}
 
-    for ADDRESS in "${RECIPIENTS[@]}"
+    while [ "$I" -le "$N" ]
     do
-        echo " $I) $ADDRESS"
+
+        local EMAIL="${RECIP_EMAILS[$((I - 1))]}"
+        local PHONE="${RECIP_PHONES[$((I - 1))]}"
+        local DESC
+
+        if [ -n "$EMAIL" ] && [ -n "$PHONE" ]
+        then
+            DESC="$EMAIL | $PHONE"
+        elif [ -n "$EMAIL" ]
+        then
+            DESC="$EMAIL"
+        else
+            DESC="SMS: $PHONE"
+        fi
+
+        echo " $I) $DESC"
         I=$((I + 1))
+
     done
 
-}
-
-
-is_valid_email()
-{
-    [[ "$1" =~ ^[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}$ ]]
 }
 
 
@@ -292,36 +396,65 @@ add_recipient()
     ensure_recipients_file
 
     echo
-    read -p "Enter email address to add (blank to cancel): " NEW_ADDRESS
+    read -p "Enter email address (blank to skip): " NEW_EMAIL
+    NEW_EMAIL="$(echo "$NEW_EMAIL" | xargs)"
 
-    NEW_ADDRESS="$(echo "$NEW_ADDRESS" | xargs)"
+    read -p "Enter phone number, international format (blank to skip): " NEW_PHONE
+    NEW_PHONE="$(echo "$NEW_PHONE" | xargs)"
 
-    if [ -z "$NEW_ADDRESS" ]
+    if [ -z "$NEW_EMAIL" ] && [ -z "$NEW_PHONE" ]
     then
-        echo "Cancelled."
+        echo "Cancelled — enter an email, a phone number, or both."
         return 0
     fi
 
-    if ! is_valid_email "$NEW_ADDRESS"
+    if [ -n "$NEW_EMAIL" ] && ! is_valid_email "$NEW_EMAIL"
     then
         echo "That doesn't look like a valid email address. Nothing added."
         return 1
     fi
 
+    if [ -n "$NEW_PHONE" ] && ! is_valid_phone "$NEW_PHONE"
+    then
+        echo "That doesn't look like a valid international phone number (expected +<country code><number>). Nothing added."
+        return 1
+    fi
+
     load_recipients
 
-    for EXISTING in "${RECIPIENTS[@]}"
+    local I=0
+    local N=${#RECIP_EMAILS[@]}
+
+    while [ "$I" -lt "$N" ]
     do
-        if [ "$EXISTING" == "$NEW_ADDRESS" ]
+
+        if [ -n "$NEW_EMAIL" ] && [ "${RECIP_EMAILS[$I]}" == "$NEW_EMAIL" ]
         then
-            echo "$NEW_ADDRESS is already in the list."
+            echo "$NEW_EMAIL is already in the list."
             return 0
         fi
+
+        if [ -n "$NEW_PHONE" ] && [ "${RECIP_PHONES[$I]}" == "$NEW_PHONE" ]
+        then
+            echo "$NEW_PHONE is already in the list."
+            return 0
+        fi
+
+        I=$((I + 1))
+
     done
 
-    echo "$NEW_ADDRESS" >> "$RECIPIENTS_FILE"
+    echo "${NEW_EMAIL}|${NEW_PHONE}" >> "$RECIPIENTS_FILE"
 
-    echo "Added $NEW_ADDRESS."
+    if [ -n "$NEW_EMAIL" ] && [ -n "$NEW_PHONE" ]
+    then
+        echo "Added $NEW_EMAIL | $NEW_PHONE."
+    elif [ -n "$NEW_EMAIL" ]
+    then
+        echo "Added $NEW_EMAIL."
+    else
+        echo "Added $NEW_PHONE."
+    fi
 
 }
 
@@ -331,7 +464,7 @@ remove_recipient()
 
     load_recipients
 
-    if [ ${#RECIPIENTS[@]} -eq 0 ]
+    if [ ${#RECIP_EMAILS[@]} -eq 0 ]
     then
         echo "No recipients to remove."
         return 0
@@ -348,18 +481,19 @@ remove_recipient()
         return 0
     fi
 
-    if ! [[ "$NUM" =~ ^[0-9]+$ ]] || [ "$NUM" -lt 1 ] || [ "$NUM" -gt ${#RECIPIENTS[@]} ]
+    if ! [[ "$NUM" =~ ^[0-9]+$ ]] || [ "$NUM" -lt 1 ] || [ "$NUM" -gt ${#RECIP_EMAILS[@]} ]
     then
         echo "Invalid selection."
         return 1
     fi
 
-    local TARGET="${RECIPIENTS[$((NUM - 1))]}"
+    local IDX=$((NUM - 1))
+    local TARGET_LINE="${RECIP_EMAILS[$IDX]}|${RECIP_PHONES[$IDX]}"
 
-    grep -vFx "$TARGET" "$RECIPIENTS_FILE" > "$RECIPIENTS_FILE.tmp" || true
+    grep -vFx "$TARGET_LINE" "$RECIPIENTS_FILE" > "$RECIPIENTS_FILE.tmp" || true
     mv "$RECIPIENTS_FILE.tmp" "$RECIPIENTS_FILE"
 
-    echo "Removed $TARGET."
+    echo "Removed $TARGET_LINE."
 
 }
 
@@ -372,7 +506,7 @@ manage_recipients_menu()
 
         echo
         echo "------------------------------------"
-        echo " Manage Recipients"
+        echo " Manage Recipients (email and SMS)"
         echo "------------------------------------"
         list_recipients
         echo
@@ -397,16 +531,26 @@ manage_recipients_menu()
 
 #############################################
 # Send email
+
 #############################################
 
 send_email()
 {
-
     load_recipients
 
-    if [ ${#RECIPIENTS[@]} -eq 0 ]
+    EMAIL_RECIPIENTS=()
+
+    for EMAIL in "${RECIP_EMAILS[@]}"
+    do
+        if [ -n "$EMAIL" ]
+        then
+            EMAIL_RECIPIENTS+=("$EMAIL")
+        fi
+    done
+
+    if [ ${#EMAIL_RECIPIENTS[@]} -eq 0 ]
     then
-        echo "No recipients configured. Use 'Manage Recipients' from the menu first."
+        echo "No email recipients configured."
         return 1
     fi
 
@@ -416,11 +560,12 @@ send_email()
         return 1
     fi
 
-    echo "Emailing report to: ${RECIPIENTS[*]}"
+    echo "Emailing report to:"
+    printf "  %s\n" "${EMAIL_RECIPIENTS[@]}"
 
     FAILED=()
 
-    for ADDRESS in "${RECIPIENTS[@]}"
+    for ADDRESS in "${EMAIL_RECIPIENTS[@]}"
     do
         if msmtp "$ADDRESS" <<EOF
 Subject: Router Location Report
@@ -428,9 +573,9 @@ Subject: Router Location Report
 $(cat "$REPORT")
 EOF
         then
-            echo " - Sent to $ADDRESS"
+            echo "Sent to $ADDRESS"
         else
-            echo " - FAILED to send to $ADDRESS"
+            echo "FAILED: $ADDRESS"
             FAILED+=("$ADDRESS")
         fi
     done
@@ -438,14 +583,13 @@ EOF
     if [ ${#FAILED[@]} -ne 0 ]
     then
         echo
-        echo "Some emails failed to send: ${FAILED[*]}"
+        echo "Some emails failed:"
+        printf "  %s\n" "${FAILED[@]}"
         return 1
     fi
 
-    echo "Email sent successfully."
-
+    echo "All emails sent successfully."
 }
-
 
 #############################################
 # Gmail / msmtp setup instructions
@@ -682,38 +826,199 @@ CODE_EOF
 }
 
 
-set_sim900_phone()
+is_valid_phone()
+{
+    [[ "$1" =~ ^\+[0-9]{7,15}$ ]]
+}
+
+
+ensure_sim900_recipients_file()
 {
 
-    echo
-    read -p "Enter destination phone number in international format (e.g. +441234567890): " NUM
-
-    NUM="$(echo "$NUM" | xargs)"
-
-    if [[ ! "$NUM" =~ ^\+[0-9]{7,15}$ ]]
+    if [ ! -f "$SIM900_RECIPIENTS_FILE" ]
     then
-        echo "That doesn't look like a valid international number (expected +<country code><number>). Nothing saved."
-        return 1
+
+        cat > "$SIM900_RECIPIENTS_FILE" <<EOF
+# One phone number per line, international format (e.g. +441234567890).
+# Lines starting with # are ignored.
+EOF
+
+        chmod 600 "$SIM900_RECIPIENTS_FILE"
+
     fi
 
-    echo "$NUM" > "$SIM900_PHONE_FILE"
-    chmod 600 "$SIM900_PHONE_FILE"
+    # Migrate a number saved by the old single-destination version, if any.
+    if [ -f "$SIM900_PHONE_FILE" ]
+    then
 
-    echo "Saved $NUM as the SIM900 destination number."
+        local EXISTING_NUM
+        EXISTING_NUM="$(cat "$SIM900_PHONE_FILE" 2>/dev/null | xargs)"
+
+        if [ -n "$EXISTING_NUM" ] && ! grep -qFx "$EXISTING_NUM" "$SIM900_RECIPIENTS_FILE" 2>/dev/null
+        then
+            echo "$EXISTING_NUM" >> "$SIM900_RECIPIENTS_FILE"
+        fi
+
+        rm -f "$SIM900_PHONE_FILE"
+
+    fi
 
 }
 
 
-get_sim900_phone()
+load_sim900_recipients()
 {
 
-    if [ ! -f "$SIM900_PHONE_FILE" ]
+    ensure_sim900_recipients_file
+
+    SIM900_RECIPIENTS=()
+
+    while IFS= read -r LINE
+    do
+
+        LINE="$(echo "$LINE" | xargs)"
+
+        if [ -z "$LINE" ] || [[ "$LINE" == \#* ]]
+        then
+            continue
+        fi
+
+        SIM900_RECIPIENTS+=("$LINE")
+
+    done < "$SIM900_RECIPIENTS_FILE"
+
+}
+
+
+list_sim900_recipients()
+{
+
+    load_sim900_recipients
+
+    if [ ${#SIM900_RECIPIENTS[@]} -eq 0 ]
     then
-        echo ""
+        echo "No SMS recipients configured yet."
+        return 0
+    fi
+
+    echo "Current SMS recipients:"
+
+    local I=1
+
+    for NUM in "${SIM900_RECIPIENTS[@]}"
+    do
+        echo " $I) $NUM"
+        I=$((I + 1))
+    done
+
+}
+
+
+add_sim900_recipient()
+{
+
+    ensure_sim900_recipients_file
+
+    echo
+    read -p "Enter phone number to add, international format (blank to cancel): " NEW_NUM
+
+    NEW_NUM="$(echo "$NEW_NUM" | xargs)"
+
+    if [ -z "$NEW_NUM" ]
+    then
+        echo "Cancelled."
+        return 0
+    fi
+
+    if ! is_valid_phone "$NEW_NUM"
+    then
+        echo "That doesn't look like a valid international number (expected +<country code><number>). Nothing added."
         return 1
     fi
 
-    cat "$SIM900_PHONE_FILE"
+    load_sim900_recipients
+
+    for EXISTING in "${SIM900_RECIPIENTS[@]}"
+    do
+        if [ "$EXISTING" == "$NEW_NUM" ]
+        then
+            echo "$NEW_NUM is already in the list."
+            return 0
+        fi
+    done
+
+    echo "$NEW_NUM" >> "$SIM900_RECIPIENTS_FILE"
+
+    echo "Added $NEW_NUM."
+
+}
+
+
+remove_sim900_recipient()
+{
+
+    load_sim900_recipients
+
+    if [ ${#SIM900_RECIPIENTS[@]} -eq 0 ]
+    then
+        echo "No SMS recipients to remove."
+        return 0
+    fi
+
+    list_sim900_recipients
+
+    echo
+    read -p "Enter the number to remove (blank to cancel): " NUM
+
+    if [ -z "$NUM" ]
+    then
+        echo "Cancelled."
+        return 0
+    fi
+
+    if ! [[ "$NUM" =~ ^[0-9]+$ ]] || [ "$NUM" -lt 1 ] || [ "$NUM" -gt ${#SIM900_RECIPIENTS[@]} ]
+    then
+        echo "Invalid selection."
+        return 1
+    fi
+
+    local TARGET="${SIM900_RECIPIENTS[$((NUM - 1))]}"
+
+    grep -vFx "$TARGET" "$SIM900_RECIPIENTS_FILE" > "$SIM900_RECIPIENTS_FILE.tmp" || true
+    mv "$SIM900_RECIPIENTS_FILE.tmp" "$SIM900_RECIPIENTS_FILE"
+
+    echo "Removed $TARGET."
+
+}
+
+
+manage_sim900_recipients_menu()
+{
+
+    while true
+    do
+
+        echo
+        echo "------------------------------------"
+        echo " Manage SMS Recipients"
+        echo "------------------------------------"
+        list_sim900_recipients
+        echo
+        echo " a) Add recipient"
+        echo " r) Remove recipient"
+        echo " b) Back"
+        echo
+
+        read -p "Choose an option: " CHOICE
+
+        case "$CHOICE" in
+            a) add_sim900_recipient ;;
+            r) remove_sim900_recipient ;;
+            b) break ;;
+            *) echo "Invalid option." ;;
+        esac
+
+    done
 
 }
 
@@ -801,14 +1106,12 @@ send_via_sim900()
         return 1
     fi
 
-    local PHONE
-    PHONE="$(get_sim900_phone)"
+    load_sim900_recipients
 
-    if [ -z "$PHONE" ]
+    if [ ${#SIM900_RECIPIENTS[@]} -eq 0 ]
     then
-        echo "No destination phone number set yet."
-        set_sim900_phone || return 1
-        PHONE="$(get_sim900_phone)"
+        echo "No SMS recipients configured. Use 'Manage SMS recipients' from this menu first."
+        return 1
     fi
 
     if [ ! -f "$REPORT" ]
@@ -827,7 +1130,7 @@ send_via_sim900()
     fi
 
     echo "Using port: $PORT"
-    echo "Sending to: $PHONE"
+    echo "Sending to: ${SIM900_RECIPIENTS[*]}"
     echo "Message: $SUMMARY"
     echo
 
@@ -837,35 +1140,40 @@ send_via_sim900()
 
     sleep 2 # allow the Uno to reset after the port opens
 
-    printf 'PHONE:%s\n' "$PHONE" >&3
-    sleep 1
-
-    printf '%s\n' "$SUMMARY" >&3
-    sleep 1
-
-    printf '###END###\n' >&3
-
-    echo "Waiting for confirmation from the Arduino..."
-
-    local START_TIME
-    START_TIME=$(date +%s)
-
-    while true
+    for PHONE in "${SIM900_RECIPIENTS[@]}"
     do
-        if read -t 1 -u 3 RESPONSE
-        then
-            echo "  Arduino: $RESPONSE"
-            if [[ "$RESPONSE" == "SMS_DONE" ]] || [[ "$RESPONSE" == ERROR:* ]]
+
+        echo "-> $PHONE"
+
+        printf 'PHONE:%s\n' "$PHONE" >&3
+        sleep 1
+
+        printf '%s\n' "$SUMMARY" >&3
+        sleep 1
+
+        printf '###END###\n' >&3
+
+        local START_TIME
+        START_TIME=$(date +%s)
+
+        while true
+        do
+            if read -t 1 -u 3 RESPONSE
             then
+                echo "  Arduino: $RESPONSE"
+                if [[ "$RESPONSE" == "SMS_DONE" ]] || [[ "$RESPONSE" == ERROR:* ]]
+                then
+                    break
+                fi
+            fi
+
+            if [ $(( $(date +%s) - START_TIME )) -gt 15 ]
+            then
+                echo "Timed out waiting for the Arduino to confirm for $PHONE."
                 break
             fi
-        fi
+        done
 
-        if [ $(( $(date +%s) - START_TIME )) -gt 15 ]
-        then
-            echo "Timed out waiting for the Arduino to confirm."
-            break
-        fi
     done
 
     exec 3<&-
@@ -885,19 +1193,11 @@ sim900_menu()
         echo " SIM900 GPRS / SMS (via Arduino USB)"
         echo "------------------------------------"
 
-        local CURRENT_PHONE
-        CURRENT_PHONE="$(get_sim900_phone)"
-
-        if [ -n "$CURRENT_PHONE" ]
-        then
-            echo " Destination number: $CURRENT_PHONE"
-        else
-            echo " Destination number: (not set)"
-        fi
+        list_sim900_recipients
 
         echo
         echo " 1) Generate Arduino sketch"
-        echo " 2) Set/change destination phone number"
+        echo " 2) Manage SMS recipients"
         echo " 3) Send report summary via SMS now"
         echo " 4) Back to main menu"
         echo
@@ -906,7 +1206,7 @@ sim900_menu()
 
         case "$CHOICE" in
             1) generate_arduino_sketch ;;
-            2) set_sim900_phone ;;
+            2) manage_sim900_recipients_menu ;;
             3) send_via_sim900 ;;
             4) break ;;
             *) echo "Invalid option." ;;
